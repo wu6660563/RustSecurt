@@ -1,0 +1,29 @@
+[package]
+name = "filehide"
+version = "1.1.0"
+description = "A fast, non-recursive Windows file hiding utility"
+authors = ["FileHide"]
+edition = "2021"
+
+[lib]
+name = "filehide_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "filehide"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+argon2 = "0.5"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+rusqlite = { version = "0.37", features = ["bundled"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+thiserror = "2"
+windows = { version = "0.62", features = ["Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }

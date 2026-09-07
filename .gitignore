@@ -1,0 +1,55 @@
+# Node / Vite
+node_modules/
+dist/
+.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Rust / Tauri build output
+src-tauri/target/
+src-tauri/gen/schemas/
+**/*.rs.bk
+
+# Local release files (publish these through GitHub Releases, not Git commits)
+release/
+artifacts/
+*.exe
+*.msi
+*.nsis.zip
+*.pdb
+
+# FileHide local data and SQLite sidecars
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Environment files and local secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# IDE / editor / OS files
+.idea/
+.vscode/
+*.code-workspace
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.vs/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs and crash dumps
+*.log
+*.dmp
+crash-dumps/
