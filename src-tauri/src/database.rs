@@ -35,7 +35,8 @@ impl Database {
                 original_attributes INTEGER NOT NULL,
                 current_status INTEGER NOT NULL,
                 create_time TEXT NOT NULL,
-                update_time TEXT NOT NULL
+                update_time TEXT NOT NULL,
+                file_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_hidden_item_status ON hidden_item(current_status);
             CREATE TABLE IF NOT EXISTS app_setting (
@@ -43,7 +44,20 @@ impl Database {
                 value TEXT NOT NULL
             );",
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(hidden_item)")
+            .map_err(|e| e.to_string())?
+            .query_map([], |row| row.get(1))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        if !columns.iter().any(|name| name == "file_id") {
+            connection
+                .execute("ALTER TABLE hidden_item ADD COLUMN file_id TEXT", [])
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -65,27 +79,74 @@ impl Database {
         item_type: &str,
         original_attributes: u32,
     ) -> Result<i64, String> {
+        self.insert_with_file_id(path, item_type, original_attributes, None)
+    }
+
+    pub fn insert_with_file_id(
+        &self,
+        path: &str,
+        item_type: &str,
+        original_attributes: u32,
+        file_id: Option<&str>,
+    ) -> Result<i64, String> {
         let now = Utc::now().to_rfc3339();
         let connection = self.0.lock().map_err(|_| "数据库锁定失败".to_string())?;
-        connection.execute("INSERT INTO hidden_item(path, item_type, original_attributes, current_status, create_time, update_time) VALUES (?1, ?2, ?3, 1, ?4, ?4)", params![path, item_type, original_attributes, now]).map_err(|error| error.to_string())?;
+        connection.execute("INSERT INTO hidden_item(path, item_type, original_attributes, current_status, create_time, update_time, file_id) VALUES (?1, ?2, ?3, 1, ?4, ?4, ?5)", params![path, item_type, original_attributes, now, file_id]).map_err(|error| error.to_string())?;
         Ok(connection.last_insert_rowid())
     }
 
     pub fn get(&self, id: i64) -> Result<HiddenItem, String> {
         self.0.lock().map_err(|_| "数据库锁定失败".to_string())?
-            .query_row("SELECT id, path, item_type, original_attributes, current_status, create_time, update_time FROM hidden_item WHERE id = ?1", [id], map_item)
+            .query_row("SELECT id, path, item_type, original_attributes, current_status, create_time, update_time, file_id FROM hidden_item WHERE id = ?1", [id], map_item)
             .map_err(|_| "未找到隐藏记录".to_string())
     }
 
     pub fn list(&self) -> Result<Vec<HiddenItem>, String> {
         let connection = self.0.lock().map_err(|_| "数据库锁定失败".to_string())?;
-        let mut statement = connection.prepare("SELECT id, path, item_type, original_attributes, current_status, create_time, update_time FROM hidden_item ORDER BY update_time DESC").map_err(|error| error.to_string())?;
+        let mut statement = connection.prepare("SELECT id, path, item_type, original_attributes, current_status, create_time, update_time, file_id FROM hidden_item ORDER BY update_time DESC").map_err(|error| error.to_string())?;
         let items = statement
             .query_map([], map_item)
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string());
         items
+    }
+
+    pub fn update_path_and_file_id(
+        &self,
+        id: i64,
+        path: &str,
+        file_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.0
+            .lock()
+            .map_err(|_| "数据库锁定失败".to_string())?
+            .execute(
+                "UPDATE hidden_item SET path = ?2, file_id = ?3, update_time = ?4 WHERE id = ?1",
+                params![id, path, file_id, Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn auto_lock_minutes(&self) -> Result<u32, String> {
+        let value: Option<String> = self
+            .0
+            .lock()
+            .map_err(|_| "数据库锁定失败".to_string())?
+            .query_row(
+                "SELECT value FROM app_setting WHERE key = 'auto_lock_minutes'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(value.and_then(|v| v.parse().ok()).unwrap_or(15))
+    }
+
+    pub fn set_auto_lock_minutes(&self, minutes: u32) -> Result<(), String> {
+        self.0.lock().map_err(|_| "数据库锁定失败".to_string())?.execute("INSERT INTO app_setting(key, value) VALUES ('auto_lock_minutes', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [minutes.to_string()]).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn mark_restored(&self, id: i64) -> Result<(), String> {
@@ -162,6 +223,7 @@ fn map_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<HiddenItem> {
         protection_status: "UNKNOWN".into(),
         create_time: row.get(5)?,
         update_time: row.get(6)?,
+        file_id: row.get(7)?,
     })
 }
 

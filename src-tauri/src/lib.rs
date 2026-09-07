@@ -17,6 +17,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::hide_file,
             commands::hide_folder,
+            commands::hide_files,
+            commands::hide_folders,
+            commands::hide_paths,
             commands::restore_item,
             commands::list_items,
             commands::start_recovery_scan,
@@ -25,7 +28,11 @@ pub fn run() {
             commands::password_configured,
             commands::verify_password,
             commands::set_access_password,
-            commands::clear_access_password
+            commands::clear_access_password,
+            commands::get_auto_lock_minutes,
+            commands::set_auto_lock_minutes,
+            commands::check_session,
+            commands::lock_session
         ])
         .run(tauri::generate_context!())
         .expect("启动 FileHide 失败");

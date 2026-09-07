@@ -17,6 +17,7 @@ const statusLabel: Record<HiddenItem['protection_status'], string> = {
   RESTORED: '已恢复',
   MISSING: '路径失效',
   UNLOCKED_EXTERNALLY: '已外部解除'
+  ,PATH_CHANGED: '路径已变化'
 }
 
 const statusClass = (status: HiddenItem['protection_status']) => `status-${status.toLowerCase().replace('_', '-')}`

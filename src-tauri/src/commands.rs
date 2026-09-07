@@ -8,6 +8,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
+    time::{Duration, Instant},
 };
 
 use argon2::{
@@ -26,7 +27,7 @@ use windows::{
 use crate::{
     database::Database,
     file_attributes,
-    models::{HiddenItem, RecoveryCandidate, RecoveryScanUpdate},
+    models::{BatchFailure, BatchResult, HiddenItem, RecoveryCandidate, RecoveryScanUpdate},
 };
 
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -36,11 +37,19 @@ const MAX_MARKER_BYTES: u64 = 128;
 
 pub struct RecoveryScans(pub Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>);
 
-pub struct AccessSession(pub Mutex<bool>);
+pub struct AccessSession(pub Mutex<SessionState>);
+
+pub struct SessionState {
+    pub unlocked: bool,
+    pub last_activity: Option<Instant>,
+}
 
 impl Default for AccessSession {
     fn default() -> Self {
-        Self(Mutex::new(false))
+        Self(Mutex::new(SessionState {
+            unlocked: false,
+            last_activity: None,
+        }))
     }
 }
 
@@ -88,15 +97,36 @@ fn password_matches(password: &str, stored_hash: &str) -> bool {
 }
 
 fn require_access(database: &Database, session: &AccessSession) -> Result<(), String> {
-    if database.password_hash()?.is_some()
-        && !*session
+    if database.password_hash()?.is_some() {
+        let minutes = database.auto_lock_minutes()?;
+        let mut state = session
             .0
             .lock()
-            .map_err(|_| "访问会话锁定失败".to_string())?
-    {
-        return Err("请先输入访问密码解锁 FileHide".into());
+            .map_err(|_| "访问会话锁定失败".to_string())?;
+        if !state.unlocked {
+            return Err("请先输入访问密码解锁 FileHide".into());
+        }
+        if minutes > 0
+            && state
+                .last_activity
+                .map(|t| t.elapsed() >= Duration::from_secs(minutes as u64 * 60))
+                .unwrap_or(false)
+        {
+            state.unlocked = false;
+            state.last_activity = None;
+            return Err("会话已自动锁定，请重新输入密码".into());
+        }
+        state.last_activity = Some(Instant::now());
     }
     Ok(())
+}
+
+fn validate_auto_lock_minutes(minutes: u32) -> Result<(), String> {
+    if [0, 5, 15, 30, 60].contains(&minutes) {
+        Ok(())
+    } else {
+        Err("自动锁定时长无效".into())
+    }
 }
 
 fn wide(path: &str) -> Vec<u16> {
@@ -115,6 +145,53 @@ fn read_attributes(path: &str) -> Result<u32, String> {
     } else {
         Ok(attributes)
     }
+}
+
+fn file_identity(path: &str) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(format!(
+        "{}:{}:{}",
+        metadata.len(),
+        modified,
+        metadata.is_dir()
+    ))
+}
+
+fn find_renamed_sibling(path: &str, expected_type: &str, stored_id: &str) -> Option<String> {
+    let parent = Path::new(path).parent()?;
+    for entry in std::fs::read_dir(parent).ok()? {
+        let candidate = match entry {
+            Ok(entry) => entry.path(),
+            Err(_) => continue,
+        };
+        if candidate.to_string_lossy().eq_ignore_ascii_case(path) {
+            continue;
+        }
+        let attributes = match read_attributes(&candidate.to_string_lossy()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if is_reparse_point(attributes) {
+            continue;
+        }
+        let metadata = match std::fs::metadata(&candidate) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if metadata.is_dir() != (expected_type == "FOLDER") {
+            continue;
+        }
+        if file_identity(&candidate.to_string_lossy()).as_deref() == Some(stored_id) {
+            return Some(remove_extended_path_prefix(&candidate.to_string_lossy()).to_owned());
+        }
+    }
+    None
 }
 
 fn set_attributes(path: &str, attributes: u32) -> Result<(), String> {
@@ -289,10 +366,11 @@ fn hide(path: String, expected_directory: bool, database: &Database) -> Result<H
         return Err("该项目已在隐藏列表中".into());
     }
     let original = read_attributes(&path)?;
-    let id = database.insert(
+    let id = database.insert_with_file_id(
         &path,
         if expected_directory { "FOLDER" } else { "FILE" },
         original,
+        file_identity(&path).as_deref(),
     )?;
     if let Err(marker_error) = write_recovery_marker(
         &path,
@@ -334,6 +412,83 @@ pub fn hide_folder(
 ) -> Result<HiddenItem, String> {
     require_access(&database, &session)?;
     hide(path, true, &database)
+}
+
+fn deduplicate_paths(paths: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    paths
+        .into_iter()
+        .filter(|p| !p.trim().is_empty() && seen.insert(p.to_lowercase()))
+        .take(256)
+        .collect()
+}
+
+fn hide_batch(
+    paths: Vec<String>,
+    expected_directory: Option<bool>,
+    database: &Database,
+) -> BatchResult {
+    let mut result = BatchResult {
+        succeeded: Vec::new(),
+        failed: Vec::new(),
+    };
+    if paths.len() > 256 {
+        result.failed.push(BatchFailure {
+            path: "<batch>".into(),
+            error: "单次最多处理 256 个项目".into(),
+        });
+        return result;
+    }
+    for path in deduplicate_paths(paths) {
+        let expected = match expected_directory {
+            Some(value) => value,
+            None => match std::fs::metadata(&path) {
+                Ok(metadata) => metadata.is_dir(),
+                Err(error) => {
+                    result.failed.push(BatchFailure {
+                        path,
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            },
+        };
+        match hide(path.clone(), expected, database) {
+            Ok(item) => result.succeeded.push(item),
+            Err(error) => result.failed.push(BatchFailure { path, error }),
+        }
+    }
+    result
+}
+
+#[tauri::command]
+pub fn hide_files(
+    paths: Vec<String>,
+    database: State<'_, Database>,
+    session: State<'_, AccessSession>,
+) -> Result<BatchResult, String> {
+    require_access(&database, &session)?;
+    Ok(hide_batch(paths, Some(false), &database))
+}
+
+#[tauri::command]
+pub fn hide_folders(
+    paths: Vec<String>,
+    database: State<'_, Database>,
+    session: State<'_, AccessSession>,
+) -> Result<BatchResult, String> {
+    require_access(&database, &session)?;
+    Ok(hide_batch(paths, Some(true), &database))
+}
+
+#[tauri::command]
+pub fn hide_paths(
+    paths: Vec<String>,
+    database: State<'_, Database>,
+    session: State<'_, AccessSession>,
+) -> Result<BatchResult, String> {
+    require_access(&database, &session)?;
+    Ok(hide_batch(paths, None, &database))
 }
 
 #[tauri::command]
@@ -534,18 +689,22 @@ pub fn verify_password(
     session: State<'_, AccessSession>,
 ) -> Result<bool, String> {
     let Some(stored_hash) = database.password_hash()? else {
-        *session
+        let mut state = session
             .0
             .lock()
-            .map_err(|_| "访问会话锁定失败".to_string())? = true;
+            .map_err(|_| "访问会话锁定失败".to_string())?;
+        state.unlocked = true;
+        state.last_activity = Some(Instant::now());
         return Ok(true);
     };
     let matches = password_matches(&password, &stored_hash);
     if matches {
-        *session
+        let mut state = session
             .0
             .lock()
-            .map_err(|_| "访问会话锁定失败".to_string())? = true;
+            .map_err(|_| "访问会话锁定失败".to_string())?;
+        state.unlocked = true;
+        state.last_activity = Some(Instant::now());
     }
     Ok(matches)
 }
@@ -564,10 +723,12 @@ pub fn set_access_password(
         }
     }
     database.set_password_hash(&password_hash(&new_password)?)?;
-    *session
+    let mut state = session
         .0
         .lock()
-        .map_err(|_| "访问会话锁定失败".to_string())? = true;
+        .map_err(|_| "访问会话锁定失败".to_string())?;
+    state.unlocked = true;
+    state.last_activity = Some(Instant::now());
     Ok(())
 }
 
@@ -584,10 +745,71 @@ pub fn clear_access_password(
         return Err("当前密码不正确".into());
     }
     database.clear_password_hash()?;
-    *session
+    let mut state = session
         .0
         .lock()
-        .map_err(|_| "访问会话锁定失败".to_string())? = true;
+        .map_err(|_| "访问会话锁定失败".to_string())?;
+    state.unlocked = true;
+    state.last_activity = Some(Instant::now());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_auto_lock_minutes(
+    database: State<'_, Database>,
+    _session: State<'_, AccessSession>,
+) -> Result<u32, String> {
+    database.auto_lock_minutes()
+}
+
+#[tauri::command]
+pub fn set_auto_lock_minutes(
+    minutes: u32,
+    database: State<'_, Database>,
+    session: State<'_, AccessSession>,
+) -> Result<(), String> {
+    require_access(&database, &session)?;
+    validate_auto_lock_minutes(minutes)?;
+    database.set_auto_lock_minutes(minutes)
+}
+
+#[tauri::command]
+pub fn check_session(
+    database: State<'_, Database>,
+    session: State<'_, AccessSession>,
+) -> Result<bool, String> {
+    if database.password_hash()?.is_none() {
+        return Ok(true);
+    }
+    let minutes = database.auto_lock_minutes()?;
+    let mut state = session
+        .0
+        .lock()
+        .map_err(|_| "访问会话锁定失败".to_string())?;
+    if !state.unlocked {
+        return Ok(false);
+    }
+    if minutes > 0
+        && state
+            .last_activity
+            .map(|t| t.elapsed() >= Duration::from_secs(minutes as u64 * 60))
+            .unwrap_or(false)
+    {
+        state.unlocked = false;
+        state.last_activity = None;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+#[tauri::command]
+pub fn lock_session(session: State<'_, AccessSession>) -> Result<(), String> {
+    let mut state = session
+        .0
+        .lock()
+        .map_err(|_| "访问会话锁定失败".to_string())?;
+    state.unlocked = false;
+    state.last_activity = None;
     Ok(())
 }
 
@@ -597,9 +819,35 @@ pub fn list_items(
     session: State<'_, AccessSession>,
 ) -> Result<Vec<HiddenItem>, String> {
     require_access(&database, &session)?;
-    database
-        .list()
-        .map(|items| items.into_iter().map(with_protection_status).collect())
+    let mut items = database.list()?;
+    for item in &mut items {
+        if item.current_status == 1 {
+            if let Some(stored) = item.file_id.clone() {
+                if file_identity(&item.path).as_deref() != Some(stored.as_str()) {
+                    if let Some(new_path) =
+                        find_renamed_sibling(&item.path, &item.item_type, &stored)
+                    {
+                        let _ = database.update_path_and_file_id(item.id, &new_path, Some(&stored));
+                        item.path = new_path;
+                        item.protection_status = protection_status(
+                            item.current_status,
+                            read_attributes(&item.path).map_err(|_| ()),
+                        )
+                        .into();
+                        continue;
+                    }
+                    item.protection_status = "PATH_CHANGED".into();
+                    continue;
+                }
+            }
+        }
+        item.protection_status = protection_status(
+            item.current_status,
+            read_attributes(&item.path).map_err(|_| ()),
+        )
+        .into();
+    }
+    Ok(items)
 }
 
 #[cfg(test)]
@@ -607,7 +855,8 @@ mod tests {
     use super::{
         is_reparse_point, parse_recovery_marker, password_hash, password_matches,
         protection_status, read_recovery_marker, remove_extended_path_prefix,
-        remove_recovery_marker, validate_new_password, write_recovery_marker,
+        remove_recovery_marker, validate_auto_lock_minutes, validate_new_password,
+        write_recovery_marker,
     };
     use std::{
         fs,
@@ -617,6 +866,14 @@ mod tests {
     #[test]
     fn active_item_with_hidden_and_system_attributes_is_locked() {
         assert_eq!(protection_status(1, Ok(0x2 | 0x4)), "LOCKED");
+    }
+
+    #[test]
+    fn auto_lock_accepts_only_supported_values() {
+        for value in [0, 5, 15, 30, 60] {
+            assert!(validate_auto_lock_minutes(value).is_ok());
+        }
+        assert!(validate_auto_lock_minutes(1).is_err());
     }
 
     #[test]

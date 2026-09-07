@@ -5,6 +5,7 @@ import styleSource from './style.css?raw'
 import { listItems, passwordConfigured } from './api/filehide'
 
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn() }))
+vi.mock('@tauri-apps/api/webview', () => ({ getCurrentWebview: () => ({ onDragDropEvent: vi.fn().mockResolvedValue(() => {}) }) }))
 vi.mock('./api/filehide', () => ({
   listItems: vi.fn().mockResolvedValue([
     {
@@ -20,6 +21,9 @@ vi.mock('./api/filehide', () => ({
   ]),
   hideFile: vi.fn(),
   hideFolder: vi.fn(),
+  hideFiles: vi.fn().mockResolvedValue({ succeeded: [], failed: [] }),
+  hideFolders: vi.fn().mockResolvedValue({ succeeded: [], failed: [] }),
+  hidePaths: vi.fn().mockResolvedValue({ succeeded: [], failed: [] }),
   restoreItem: vi.fn(),
   passwordConfigured: vi.fn().mockResolvedValue(false),
   verifyPassword: vi.fn(),
@@ -27,7 +31,11 @@ vi.mock('./api/filehide', () => ({
   clearAccessPassword: vi.fn(),
   startRecoveryScan: vi.fn(),
   cancelRecoveryScan: vi.fn(),
-  recoverMarkedItem: vi.fn()
+  recoverMarkedItem: vi.fn(),
+  getAutoLockMinutes: vi.fn().mockResolvedValue(15),
+  setAutoLockMinutes: vi.fn(),
+  checkSession: vi.fn().mockResolvedValue(true),
+  lockSession: vi.fn()
 }))
 
 describe('hidden item list', () => {

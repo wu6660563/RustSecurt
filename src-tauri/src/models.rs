@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HiddenItem {
     pub id: i64,
     pub path: String,
@@ -10,6 +10,19 @@ pub struct HiddenItem {
     pub protection_status: String,
     pub create_time: String,
     pub update_time: String,
+    pub file_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchFailure {
+    pub path: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchResult {
+    pub succeeded: Vec<HiddenItem>,
+    pub failed: Vec<BatchFailure>,
 }
 
 #[derive(Debug, Clone, Serialize)]
