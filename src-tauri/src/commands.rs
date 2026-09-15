@@ -19,15 +19,23 @@ use rand_core::OsRng;
 use tauri::{AppHandle, Emitter, State};
 use windows::{
     core::PCWSTR,
+    Win32::Foundation::CloseHandle,
     Win32::Storage::FileSystem::{
-        GetFileAttributesW, SetFileAttributesW, FILE_FLAGS_AND_ATTRIBUTES, INVALID_FILE_ATTRIBUTES,
+        CreateFileW, GetFileAttributesW, GetFileInformationByHandle, SetFileAttributesW,
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, INVALID_FILE_ATTRIBUTES, OPEN_EXISTING,
     },
 };
+use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
 use crate::{
     database::Database,
     file_attributes,
-    models::{BatchFailure, BatchResult, HiddenItem, RecoveryCandidate, RecoveryScanUpdate},
+    models::{
+        BatchFailure, BatchResult, DeleteHistoryResult, HealthSummary, HiddenItem, PreviewItem,
+        RecoveryCandidate, RecoveryScanUpdate, StorageInfo,
+    },
 };
 
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -148,18 +156,30 @@ fn read_attributes(path: &str) -> Result<u32, String> {
 }
 
 fn file_identity(path: &str) -> Option<String> {
-    let metadata = std::fs::metadata(path).ok()?;
-    let modified = metadata
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
+    let wide_path = wide(path);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide_path.as_ptr()),
+            FILE_GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    }
+    .ok()?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    let success = unsafe { GetFileInformationByHandle(handle, &mut info).is_ok() };
+    unsafe {
+        CloseHandle(handle).ok();
+    }
+    if !success {
+        return None;
+    }
     Some(format!(
         "{}:{}:{}",
-        metadata.len(),
-        modified,
-        metadata.is_dir()
+        info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow
     ))
 }
 
@@ -365,6 +385,12 @@ fn hide(path: String, expected_directory: bool, database: &Database) -> Result<H
     if database.active_item_for_path(&path)?.is_some() {
         return Err("该项目已在隐藏列表中".into());
     }
+    let operation_id = format!(
+        "{}-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        path
+    );
+    database.begin_operation(&operation_id, &path)?;
     let original = read_attributes(&path)?;
     let id = database.insert_with_file_id(
         &path,
@@ -372,18 +398,21 @@ fn hide(path: String, expected_directory: bool, database: &Database) -> Result<H
         original,
         file_identity(&path).as_deref(),
     )?;
+    database.update_operation(&operation_id, Some(id), "recorded")?;
     if let Err(marker_error) = write_recovery_marker(
         &path,
         if expected_directory { "FOLDER" } else { "FILE" },
         original,
     ) {
         let _ = database.remove_active_item(id);
+        let _ = database.finish_operation(&operation_id);
         return Err(marker_error);
     }
     if let Err(attribute_error) =
         set_attributes(&path, file_attributes::attributes_to_hide(original))
     {
         let _ = remove_recovery_marker(&path);
+        let _ = database.finish_operation(&operation_id);
         return match database.remove_active_item(id) {
             Ok(()) => Err(format!("锁定失败，未创建历史记录：{attribute_error}")),
             Err(cleanup_error) => Err(format!(
@@ -391,7 +420,18 @@ fn hide(path: String, expected_directory: bool, database: &Database) -> Result<H
             )),
         };
     }
-    database.get(id).map(with_protection_status)
+    let item = database.get(id).map(with_protection_status)?;
+    database.update_operation(&operation_id, Some(id), "committed")?;
+    database.finish_operation(&operation_id)?;
+    Ok(item)
+}
+
+pub fn lock_from_context_menu(path: String, database: &Database) -> Result<(), String> {
+    if database.password_hash()?.is_some() {
+        return Err("已设置访问密码，请打开 FileHide 后手动锁定。".into());
+    }
+    let metadata = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    hide(path, metadata.is_dir(), database).map(|_| ())
 }
 
 #[tauri::command]
@@ -462,6 +502,59 @@ fn hide_batch(
 }
 
 #[tauri::command]
+pub fn preview_paths(
+    paths: Vec<String>,
+    database: State<'_, Database>,
+    session: State<'_, AccessSession>,
+) -> Result<Vec<PreviewItem>, String> {
+    require_access(&database, &session)?;
+    if paths.len() > 256 {
+        return Err("单次最多预览 256 个项目".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut previews = Vec::new();
+    for path in paths
+        .into_iter()
+        .filter(|path| seen.insert(path.to_lowercase()))
+    {
+        let mut risks = Vec::new();
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                previews.push(PreviewItem {
+                    path,
+                    item_type: "UNKNOWN".into(),
+                    risks: vec!["路径不存在或无法访问".into()],
+                    can_lock: false,
+                });
+                continue;
+            }
+        };
+        let attributes = read_attributes(&path).unwrap_or(0);
+        if is_reparse_point(attributes) {
+            risks.push("符号链接或联接点".into());
+        }
+        let canonical = resolve_target_path(&path, metadata.is_dir());
+        if let Ok(canonical) = canonical {
+            if database.active_item_for_path(&canonical)?.is_some() {
+                risks.push("已在隐藏列表中".into());
+            }
+            if read_recovery_marker(&canonical).is_some() {
+                risks.push("已存在 FileHide 恢复标记".into());
+            }
+        }
+        let can_lock = risks.is_empty();
+        previews.push(PreviewItem {
+            path,
+            item_type: if metadata.is_dir() { "FOLDER" } else { "FILE" }.into(),
+            risks,
+            can_lock,
+        });
+    }
+    Ok(previews)
+}
+
+#[tauri::command]
 pub fn hide_files(
     paths: Vec<String>,
     database: State<'_, Database>,
@@ -491,13 +584,7 @@ pub fn hide_paths(
     Ok(hide_batch(paths, None, &database))
 }
 
-#[tauri::command]
-pub fn restore_item(
-    id: i64,
-    database: State<'_, Database>,
-    session: State<'_, AccessSession>,
-) -> Result<HiddenItem, String> {
-    require_access(&database, &session)?;
+fn restore_one(id: i64, database: &Database) -> Result<HiddenItem, String> {
     let item = database.get(id)?;
     if item.current_status == 0 {
         return Err("该项目已恢复".into());
@@ -531,6 +618,39 @@ pub fn restore_item(
         };
     }
     database.get(id).map(with_protection_status)
+}
+
+#[tauri::command]
+pub fn restore_item(
+    id: i64,
+    database: State<'_, Database>,
+    session: State<'_, AccessSession>,
+) -> Result<HiddenItem, String> {
+    require_access(&database, &session)?;
+    restore_one(id, &database)
+}
+
+#[tauri::command]
+pub fn restore_items(
+    ids: Vec<i64>,
+    database: State<'_, Database>,
+    session: State<'_, AccessSession>,
+) -> Result<BatchResult, String> {
+    require_access(&database, &session)?;
+    let mut result = BatchResult {
+        succeeded: Vec::new(),
+        failed: Vec::new(),
+    };
+    for id in ids.into_iter().take(256) {
+        match restore_one(id, &database) {
+            Ok(item) => result.succeeded.push(item),
+            Err(error) => result.failed.push(BatchFailure {
+                path: id.to_string(),
+                error,
+            }),
+        }
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -829,14 +949,15 @@ pub fn list_items(
                     {
                         let _ = database.update_path_and_file_id(item.id, &new_path, Some(&stored));
                         item.path = new_path;
-                        item.protection_status = protection_status(
-                            item.current_status,
-                            read_attributes(&item.path).map_err(|_| ()),
-                        )
-                        .into();
+                        item.protection_status = "PATH_MOVED".into();
                         continue;
                     }
-                    item.protection_status = "PATH_CHANGED".into();
+                    item.protection_status = if read_attributes(&item.path).is_ok() {
+                        "PATH_REPLACED"
+                    } else {
+                        "PATH_DELETED"
+                    }
+                    .into();
                     continue;
                 }
             }
@@ -848,6 +969,146 @@ pub fn list_items(
         .into();
     }
     Ok(items)
+}
+
+#[tauri::command]
+pub fn health_check(
+    database: State<'_, Database>,
+    session: State<'_, AccessSession>,
+) -> Result<HealthSummary, String> {
+    require_access(&database, &session)?;
+    let items = database.list()?;
+    let mut summary = HealthSummary {
+        checked: 0,
+        healthy: 0,
+        changed: 0,
+    };
+    for item in items.into_iter().filter(|item| item.current_status == 1) {
+        summary.checked += 1;
+        let healthy = item
+            .file_id
+            .as_deref()
+            .and_then(|id| file_identity(&item.path).map(|current| current == id))
+            .unwrap_or(false)
+            && protection_status(
+                item.current_status,
+                read_attributes(&item.path).map_err(|_| ()),
+            ) == "LOCKED";
+        if healthy {
+            summary.healthy += 1;
+        } else {
+            summary.changed += 1;
+        }
+    }
+    Ok(summary)
+}
+
+#[tauri::command]
+pub fn delete_history(
+    ids: Vec<i64>,
+    remove_markers: bool,
+    database: State<'_, Database>,
+    session: State<'_, AccessSession>,
+) -> Result<DeleteHistoryResult, String> {
+    require_access(&database, &session)?;
+    let mut result = DeleteHistoryResult {
+        succeeded: Vec::new(),
+        failed: Vec::new(),
+    };
+    for id in ids.into_iter().take(256) {
+        let item = match database.get(id) {
+            Ok(item) => item,
+            Err(error) => {
+                result.failed.push(BatchFailure {
+                    path: id.to_string(),
+                    error,
+                });
+                continue;
+            }
+        };
+        if item.current_status != 0 {
+            result.failed.push(BatchFailure {
+                path: item.path,
+                error: "仍处于活动锁定状态，请先恢复后再删除历史".into(),
+            });
+            continue;
+        }
+        if remove_markers && read_recovery_marker(&item.path).is_some() {
+            if let Err(error) = remove_recovery_marker(&item.path) {
+                result.failed.push(BatchFailure {
+                    path: item.path,
+                    error,
+                });
+                continue;
+            }
+        }
+        match database.delete_history_item(id) {
+            Ok(()) => result.succeeded.push(id),
+            Err(error) => result.failed.push(BatchFailure {
+                path: item.path,
+                error,
+            }),
+        }
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn storage_info(
+    database: State<'_, Database>,
+    session: State<'_, AccessSession>,
+) -> Result<StorageInfo, String> {
+    require_access(&database, &session)?;
+    Database::storage_info()
+}
+
+fn context_menu_key_path() -> &'static str {
+    "Software\\Classes\\*\\shell\\FileHide"
+}
+fn context_menu_folder_key_path() -> &'static str {
+    "Software\\Classes\\Directory\\shell\\FileHide"
+}
+
+#[tauri::command]
+pub fn context_menu_enabled(
+    database: State<'_, Database>,
+    session: State<'_, AccessSession>,
+) -> Result<bool, String> {
+    require_access(&database, &session)?;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    Ok(hkcu.open_subkey(context_menu_key_path()).is_ok()
+        && hkcu.open_subkey(context_menu_folder_key_path()).is_ok())
+}
+
+#[tauri::command]
+pub fn set_context_menu_enabled(
+    enabled: bool,
+    database: State<'_, Database>,
+    session: State<'_, AccessSession>,
+) -> Result<(), String> {
+    require_access(&database, &session)?;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if !enabled {
+        let _ = hkcu.delete_subkey_all(context_menu_key_path());
+        let _ = hkcu.delete_subkey_all(context_menu_folder_key_path());
+        return Ok(());
+    }
+    let exe = std::env::current_exe()
+        .map_err(|e| e.to_string())?
+        .to_string_lossy()
+        .replace('"', "");
+    let command = format!("\"{}\" lock \"%1\"", exe);
+    for key_path in [context_menu_key_path(), context_menu_folder_key_path()] {
+        let (key, _) = hkcu.create_subkey(key_path).map_err(|e| e.to_string())?;
+        key.set_value("MUIVerb", &"使用 FileHide 锁定")
+            .map_err(|e| e.to_string())?;
+        key.set_value("Icon", &exe).map_err(|e| e.to_string())?;
+        let (command_key, _) = key.create_subkey("command").map_err(|e| e.to_string())?;
+        command_key
+            .set_value("", &command)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -24,6 +24,8 @@ vi.mock('./api/filehide', () => ({
   hideFiles: vi.fn().mockResolvedValue({ succeeded: [], failed: [] }),
   hideFolders: vi.fn().mockResolvedValue({ succeeded: [], failed: [] }),
   hidePaths: vi.fn().mockResolvedValue({ succeeded: [], failed: [] }),
+  previewPaths: vi.fn().mockResolvedValue([]),
+  healthCheck: vi.fn().mockResolvedValue({ checked: 0, healthy: 0, changed: 0 }),
   restoreItem: vi.fn(),
   passwordConfigured: vi.fn().mockResolvedValue(false),
   verifyPassword: vi.fn(),

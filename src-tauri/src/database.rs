@@ -10,15 +10,44 @@ pub struct Database(pub Mutex<Connection>);
 
 impl Database {
     pub fn open(app: &AppHandle) -> Result<Self, String> {
-        let data_dir = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| error.to_string())?;
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|p| p.to_path_buf()));
+        let portable_dir = exe_dir.filter(|dir| dir.join("portable.flag").is_file());
+        let data_dir = match portable_dir {
+            Some(dir) => dir,
+            None => app
+                .path()
+                .app_data_dir()
+                .map_err(|error| error.to_string())?,
+        };
         std::fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
         let connection =
             Connection::open(data_dir.join("filehide.db")).map_err(|error| error.to_string())?;
         Self::initialize(&connection)?;
         Ok(Self(Mutex::new(connection)))
+    }
+
+    pub fn storage_info() -> Result<crate::models::StorageInfo, String> {
+        let exe_dir = std::env::current_exe()
+            .map_err(|e| e.to_string())?
+            .parent()
+            .ok_or_else(|| "无法确定程序目录".to_string())?
+            .to_path_buf();
+        let marker = exe_dir.join("portable.flag");
+        if marker.is_file() {
+            Ok(crate::models::StorageInfo {
+                mode: "PORTABLE".into(),
+                path: exe_dir.to_string_lossy().into_owned(),
+                portable_marker: marker.to_string_lossy().into_owned(),
+            })
+        } else {
+            Ok(crate::models::StorageInfo {
+                mode: "APP_DATA".into(),
+                path: "系统应用数据目录".into(),
+                portable_marker: marker.to_string_lossy().into_owned(),
+            })
+        }
     }
 
     fn initialize(connection: &Connection) -> Result<(), String> {
@@ -42,6 +71,13 @@ impl Database {
             CREATE TABLE IF NOT EXISTS app_setting (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS operation_journal (
+                operation_id TEXT PRIMARY KEY,
+                item_id INTEGER,
+                path TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );",
             )
             .map_err(|error| error.to_string())?;
@@ -129,6 +165,57 @@ impl Database {
         Ok(())
     }
 
+    pub fn begin_operation(&self, operation_id: &str, path: &str) -> Result<(), String> {
+        self.0.lock().map_err(|_| "数据库锁定失败".to_string())?.execute("INSERT INTO operation_journal(operation_id, path, phase, created_at) VALUES (?1, ?2, 'prepared', ?3)", params![operation_id, path, Utc::now().to_rfc3339()]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn update_operation(
+        &self,
+        operation_id: &str,
+        item_id: Option<i64>,
+        phase: &str,
+    ) -> Result<(), String> {
+        self.0
+            .lock()
+            .map_err(|_| "数据库锁定失败".to_string())?
+            .execute(
+                "UPDATE operation_journal SET item_id = ?2, phase = ?3 WHERE operation_id = ?1",
+                params![operation_id, item_id, phase],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn finish_operation(&self, operation_id: &str) -> Result<(), String> {
+        self.0
+            .lock()
+            .map_err(|_| "数据库锁定失败".to_string())?
+            .execute(
+                "DELETE FROM operation_journal WHERE operation_id = ?1",
+                [operation_id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn recover_operations(&self) -> Result<u32, String> {
+        let connection = self.0.lock().map_err(|_| "数据库锁定失败".to_string())?;
+        let mut statement = connection
+            .prepare("SELECT operation_id FROM operation_journal")
+            .map_err(|e| e.to_string())?;
+        let ids: Vec<String> = statement
+            .query_map([], |row| row.get(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        let count = ids.len() as u32;
+        connection
+            .execute("DELETE FROM operation_journal", [])
+            .map_err(|e| e.to_string())?;
+        Ok(count)
+    }
+
     pub fn auto_lock_minutes(&self) -> Result<u32, String> {
         let value: Option<String> = self
             .0
@@ -171,6 +258,22 @@ impl Database {
             .map_err(|error| error.to_string())?;
         if changed != 1 {
             return Err("无法清理未完成的隐藏记录".into());
+        }
+        Ok(())
+    }
+
+    pub fn delete_history_item(&self, id: i64) -> Result<(), String> {
+        let changed = self
+            .0
+            .lock()
+            .map_err(|_| "数据库锁定失败".to_string())?
+            .execute(
+                "DELETE FROM hidden_item WHERE id = ?1 AND current_status = 0",
+                [id],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("只能删除已恢复的历史记录".into());
         }
         Ok(())
     }

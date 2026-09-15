@@ -800,6 +800,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "thiserror 2.0.19",
  "windows 0.62.2",
+ "winreg",
 ]
 
 [[package]]
